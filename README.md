@@ -97,7 +97,3 @@ The system automatically:
 - Uses pyzipper for ZIP compression with AES encryption
 - Employs progress bars to visualize the backup process
 - Handles relative paths to maintain directory structure in the archive
-
-## License
-
-[MIT License](LICENSE)
