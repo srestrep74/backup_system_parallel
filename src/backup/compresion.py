@@ -2,26 +2,80 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+import multiprocessing
 
 import pyzipper
 import dask.bag as db
 from dask.diagnostics import ProgressBar
-from dask.distributed import Client, LocalCluster
-import multiprocessing
+
+
+def compress_chunk(chunk_data):
+    chunk_files, chunk_index, temp_dir, compression_level, password = chunk_data
+    temp_zip = os.path.join(temp_dir, f"chunk_{chunk_index}.zip")
+
+    with pyzipper.AESZipFile(
+        temp_zip,
+        "w",
+        compression=pyzipper.ZIP_DEFLATED,
+        compresslevel=compression_level,
+        encryption=pyzipper.WZ_AES if password else None,
+    ) as zipf:
+        if password:
+            zipf.setpassword(password.encode())
+
+        for file_path, rel_path in chunk_files:
+            try:
+                zipf.write(file_path, arcname=rel_path)
+            except Exception as e:
+                print(f"Error adding {file_path}: {e}")
+
+    return temp_zip
+
+
+def process_chunk_for_merge(chunk_file):
+    try:
+        items = []
+        with pyzipper.AESZipFile(chunk_file, "r") as chunk_zip:
+            for item in chunk_zip.infolist():
+                content = chunk_zip.read(item.filename)
+                items.append((item.filename, content))
+        return items
+    except Exception as e:
+        print(f"Error processing chunk {chunk_file}: {e}")
+        return []
+
 
 class ParallelZipCompressor:
-    def __init__(self, compression_level=6, chunk_size=1000):
+    def __init__(self, compression_level=6, chunk_size=1000, min_files_for_chunking=500):
         self.compression_level = compression_level
         self.chunk_size = chunk_size
+        self.min_files_for_chunking = min_files_for_chunking
         self.temp_dir = None
 
-    def _compress_chunk(self, chunk_data):
-        """Compress a chunk of files into a temporary zip file."""
-        chunk_files, chunk_index, password = chunk_data
-        temp_zip = os.path.join(self.temp_dir, f"chunk_{chunk_index}.zip")
-
+    def _compress_direct(self, files, output_path, password=None):
+        print(f"Using direct compression for {len(files)} files...")
+        
+        files = [Path(f) for f in files]
+        n_workers = min(16, max(1, multiprocessing.cpu_count() - 1))
+        
+        def prepare_paths(file_path):
+            try:
+                rel_path = file_path.relative_to(file_path.anchor)
+                return str(file_path), str(rel_path)
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+                return None
+        
+        bag = db.from_sequence(files, npartitions=n_workers)
+        
+        with ProgressBar():
+            print("Preparing file paths...")
+            file_pairs = bag.map(prepare_paths).filter(lambda x: x).compute()
+        
+        print(f"Creating ZIP archive directly: {output_path}")
+        
         with pyzipper.AESZipFile(
-            temp_zip,
+            output_path,
             "w",
             compression=pyzipper.ZIP_DEFLATED,
             compresslevel=self.compression_level,
@@ -29,48 +83,39 @@ class ParallelZipCompressor:
         ) as zipf:
             if password:
                 zipf.setpassword(password.encode())
-
-            for file_path, rel_path in chunk_files:
+            
+            def add_file_to_zip(file_pair):
+                file_path, rel_path = file_pair
                 try:
-                    zipf.write(file_path, arcname=rel_path)
+                    with open(file_path, 'rb') as f:
+                        content = f.read()
+                    return rel_path, content
                 except Exception as e:
-                    print(f"Error adding {file_path}: {e}")
-
-        return temp_zip
-
-    def _merge_chunks(self, chunk_files, output_path, password=None):
-        """Merge chunk files into final zip file."""
-        with pyzipper.AESZipFile(
-            output_path,
-            "w",
-            compression=pyzipper.ZIP_DEFLATED,
-            compresslevel=self.compression_level,
-            encryption=pyzipper.WZ_AES if password else None,
-        ) as final_zip:
-            if password:
-                final_zip.setpassword(password.encode())
-
-            for chunk_file in chunk_files:
-                with pyzipper.AESZipFile(chunk_file, "r") as chunk_zip:
-                    for item in chunk_zip.infolist():
-                        final_zip.writestr(item, chunk_zip.read(item.filename))
+                    print(f"Error reading {file_path}: {e}")
+                    return None
+            
+            chunk_size = 100
+            for i in range(0, len(file_pairs), chunk_size):
+                chunk = file_pairs[i:i+chunk_size]
+                chunk_bag = db.from_sequence(chunk, npartitions=min(len(chunk), n_workers))
+                
+                with ProgressBar():
+                    print(f"Processing files {i+1}-{min(i+chunk_size, len(file_pairs))} of {len(file_pairs)}...")
+                    file_contents = chunk_bag.map(add_file_to_zip).filter(lambda x: x).compute()
+                
+                for rel_path, content in file_contents:
+                    zipf.writestr(rel_path, content)
         
-        return output_path
+        print(f"Direct compression completed: {output_path}")
+        return Path(output_path).absolute()
 
-    def compress(self, files, output_path, password=None):
-        """Compress files in parallel using Dask."""
+    def _compress_chunked(self, files, output_path, password=None):
         self.temp_dir = tempfile.mkdtemp(prefix="parallel_zip_")
         n_workers = min(16, max(1, multiprocessing.cpu_count() - 1))
         
         try:
-            print(f"Processing {len(files)} files with {n_workers} workers...")
+            print(f"Using chunked compression for {len(files)} files with {n_workers} workers...")
             
-            # Optionally, use Dask distributed for better scale-out
-            # cluster = LocalCluster(n_workers=n_workers, threads_per_worker=1)
-            # client = Client(cluster)
-            # print(f"Dask dashboard available at: {client.dashboard_link}")
-            
-            # Step 1: Prepare file paths using Dask
             def prepare_paths(file_path):
                 try:
                     rel_path = Path(file_path).relative_to(Path(file_path).anchor)
@@ -85,33 +130,64 @@ class ParallelZipCompressor:
                 print("Preparing file paths...")
                 file_pairs = bag.map(prepare_paths).filter(lambda x: x).compute()
             
-            print(f"Preparing to compress {len(file_pairs)} files...")
+            print(f"Preparing chunked compression for {len(file_pairs)} files...")
             
-            # Step 2: Create chunks
+            adaptive_chunk_size = min(self.chunk_size, max(100, len(file_pairs) // (n_workers * 2)))
+            
             chunks = [
-                file_pairs[i : i + self.chunk_size]
-                for i in range(0, len(file_pairs), self.chunk_size)
+                file_pairs[i : i + adaptive_chunk_size]
+                for i in range(0, len(file_pairs), adaptive_chunk_size)
             ]
             
-            # Step 3: Prepare data for chunk compression
-            chunk_data = [(chunk, idx, password) for idx, chunk in enumerate(chunks)]
+            chunk_data = [
+                (chunk, idx, self.temp_dir, self.compression_level, password) 
+                for idx, chunk in enumerate(chunks)
+            ]
             
-            # Step 4: Compress chunks in parallel using Dask
+            print(f"Compressing in {len(chunks)} parallel chunks...")
+            
             chunk_bag = db.from_sequence(chunk_data, npartitions=min(len(chunk_data), n_workers))
             
             with ProgressBar():
-                print(f"Compressing in {len(chunks)} parallel chunks...")
-                chunk_files = chunk_bag.map(self._compress_chunk).compute()
+                print("Compressing chunks...")
+                chunk_files = chunk_bag.map(compress_chunk).compute()
             
-            # Step 5: Merge chunks (this could be a bottleneck, so it's done sequentially)
             print(f"Merging {len(chunk_files)} chunk files into final zip: '{output_path}'")
-            result_path = self._merge_chunks(chunk_files, output_path, password)
             
-            print(f"Compression completed: {result_path}")
-            return Path(result_path).absolute()
+            with pyzipper.AESZipFile(
+                output_path,
+                "w",
+                compression=pyzipper.ZIP_DEFLATED,
+                compresslevel=self.compression_level,
+                encryption=pyzipper.WZ_AES if password else None,
+            ) as final_zip:
+                if password:
+                    final_zip.setpassword(password.encode())
+                
+                batch_size = max(1, len(chunk_files) // n_workers)
+                
+                for i in range(0, len(chunk_files), batch_size):
+                    batch = chunk_files[i:i+batch_size]
+                    
+                    chunk_bag = db.from_sequence(batch, npartitions=min(len(batch), n_workers))
+                    
+                    with ProgressBar():
+                        print(f"Processing merge batch {i//batch_size + 1}/{(len(chunk_files)-1)//batch_size + 1}...")
+                        batch_items = chunk_bag.map(process_chunk_for_merge).flatten().compute()
+                    
+                    for filename, content in batch_items:
+                        final_zip.writestr(filename, content)
+            
+            print(f"Chunked compression completed: {output_path}")
+            return Path(output_path).absolute()
             
         finally:
-            # Cleanup
             if self.temp_dir and os.path.exists(self.temp_dir):
                 shutil.rmtree(self.temp_dir)
                 self.temp_dir = None
+
+    def compress(self, files, output_path, password=None):
+        if len(files) < self.min_files_for_chunking:
+            return self._compress_direct(files, output_path, password)
+        else:
+            return self._compress_chunked(files, output_path, password)

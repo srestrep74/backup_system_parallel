@@ -19,7 +19,7 @@ def main(folders, output, password, workers, chunk_size):
     if workers is None:
         workers = min(8, max(1, multiprocessing.cpu_count() - 1))
     
-    click.echo(f"Iniciando backup con {workers} workers y chunks de {chunk_size} archivos")
+    click.echo(f"Starting backup with {workers} workers and chunk size {chunk_size}")
     
     try:
         # Use parallel file discovery
