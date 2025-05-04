@@ -4,6 +4,7 @@ from pathlib import Path
 import multiprocessing
 from .utils.file_finder import FileFinder
 from .backup.compresion import ParallelZipCompressor
+from .utils.storage import storage_menu
 
 @click.command()
 @click.argument('folders', nargs=-1, type=click.Path(exists=True, path_type=Path))
@@ -32,10 +33,13 @@ def main(folders, output, password, workers, chunk_size):
         result_path = compressor.compress(files, output_path, password)
 
         click.echo(f'Backup completed successfully: {result_path}')
+        
+        if click.confirm('\nDo you want to save a copy to external storage?'):
+            storage_menu(Path(result_path))
+            
     except Exception as e:
         click.echo(f'An error occurred: {e}', err=True)
         raise
 
 if __name__ == '__main__':
     main()
-
