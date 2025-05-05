@@ -7,7 +7,7 @@ from .utils.file_finder import FileFinder
 from .backup.compresion import ParallelZipCompressor
 from .utils.storage import storage_menu
 from .backup.cloud import upload_to_drive_service, restore_backup_drive
-from .backup.restore import restore_backup
+from .backup.local_restore import restore_backup
 
 @click.group()
 def cli():
