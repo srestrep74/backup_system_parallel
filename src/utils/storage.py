@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Tuple, List
 import click
 import psutil
+from .DatabaseManager import DatabaseManager
 
 
 def get_connected_devices() -> List[Tuple[str, str]]:
@@ -67,7 +68,14 @@ def storage_menu(file_path: Path) -> None:
         click.echo(f"\nTotal file size: {round(file_size / (1024 * 1024), 2)} MB")
         remaining = file_size
         part_index = 1
-
+        total_parts = 0
+        
+        # Initialize the DatabaseManager only for fragmentation
+        db_manager = DatabaseManager()
+        
+        # Track how many parts we'll need
+        part_estimation = []
+        
         click.echo("Assign space for each USB device. Press Enter to store the remaining file size in the device.")
 
         while remaining > 0:
@@ -82,8 +90,10 @@ def storage_menu(file_path: Path) -> None:
 
             mountpoint = usb_devices[idx - 1][0]
             max_mb = round(remaining / (1024 * 1024), 2)
-            user_input = click.prompt(f"How many MB to copy to {mountpoint}? (Remaining: {max_mb} MB) or press Enter to use all",
-                                      default='', show_default=False)
+            user_input = click.prompt(
+                f"How many MB to copy to {mountpoint}? (Remaining: {max_mb} MB) or press Enter to use all",
+                default='', show_default=False
+            )
 
             if user_input.strip() == '':
                 bytes_to_assign = remaining
@@ -97,26 +107,48 @@ def storage_menu(file_path: Path) -> None:
                     click.echo("Invalid input. Please enter a number or press Enter.")
                     continue
 
-            part_path = file_path.parent / f"{file_path.stem}.part{part_index:03d}"
-            with open(file_path, 'rb') as src:
-                src.seek(file_size - remaining)
-                with open(part_path, 'wb') as part_file:
-                    part_file.write(src.read(bytes_to_assign))
-
-            ok, msg = copy_to_device(part_path, mountpoint)
-            click.echo(f"{'Copied' if ok else 'Error'}: {msg}")
-
-            if ok:
-                try:
-                    part_path.unlink()
-                    click.echo(f"Deleted partition file: {part_path.name}")
-                except Exception as e:
-                    click.echo(f"Error deleting {part_path.name}: {e}")
-
-                remaining -= bytes_to_assign
-                part_index += 1
-            else:
-                click.echo("Copy failed. Try a different device or size.")
+            part_estimation.append((mountpoint, bytes_to_assign))
+            remaining -= bytes_to_assign
+            
+            if remaining <= 0:
+                total_parts = len(part_estimation)
+                remaining = file_size
+                part_index = 1
+                
+                for mountpoint, bytes_to_assign in part_estimation:
+                    part_name = f"{file_path.stem}.part{part_index:03d}"
+                    part_path = file_path.parent / part_name
+                    
+                    with open(file_path, 'rb') as src:
+                        src.seek(file_size - remaining)
+                        with open(part_path, 'wb') as part_file:
+                            part_file.write(src.read(bytes_to_assign))
+                    
+                    ok, msg = copy_to_device(part_path, mountpoint)
+                    click.echo(f"{'Copied' if ok else 'Error'}: {msg}")
+                    
+                    if ok:
+                        # Record the fragment in the database
+                        db_manager.insert_fragment(
+                            filename=file_path.name,
+                            path=str(Path(mountpoint) / part_name)
+                        )
+                        
+                        try:
+                            part_path.unlink()
+                            click.echo(f"Deleted partition file: {part_path.name}")
+                        except Exception as e:
+                            click.echo(f"Error deleting {part_path.name}: {e}")
+                        
+                        remaining -= bytes_to_assign
+                        part_index += 1
+                    else:
+                        click.echo("Copy failed. Try a different device or size.")
+                        break
+                
+                click.echo(f"\nFragmentation complete! File '{file_path.name}' split into {total_parts} parts.")
+                click.echo("Fragments have been recorded in the database.")
 
     else:
         click.echo("Invalid choice!")
+        return

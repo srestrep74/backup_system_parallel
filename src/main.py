@@ -7,7 +7,7 @@ from .utils.file_finder import FileFinder
 from .backup.compresion import ParallelZipCompressor
 from .utils.storage import storage_menu
 from .backup.drive import upload_to_drive_service, restore_backup_drive
-from .backup.local_restore import restore_backup
+from .backup.local_restore import restore_backup, restore_fragmented_backup
 
 @click.group()
 def cli():
@@ -83,6 +83,19 @@ def restore_drive(file_id, config_path, output_dir, password):
         click.echo(f"✔ Backup restored from Drive to: {output_dir}")
     except Exception as e:
         click.echo(f" X  Error during restore from Drive: {e}", err=True)
+        raise
+
+# ---- Subcommand: Restore fragmented backup ---- #
+@restore.command('fragmented')
+@click.option('--filename', '-f', required=True, help='Original filename to restore (e.g. backup_20250511_020917.zip)')
+@click.option('--output-dir', '-o', required=True, type=click.Path(path_type=Path), help='Directory to restore the contents')
+@click.option('--password', '-p', default=None, help='Password if the backup is encrypted')
+def restore_fragmented(filename, output_dir, password):
+    try:
+        restore_fragmented_backup(filename, output_dir, password)
+        click.echo(f"✔ Fragmented backup {filename} restored and extracted to: {output_dir}")
+    except Exception as e:
+        click.echo(f" X  Error during fragmented restore: {e}", err=True)
         raise
 
 if __name__ == '__main__':
