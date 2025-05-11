@@ -1,4 +1,4 @@
 venv/
 __pycache__/
 backup_*_*.zip
-your-service-account.json
+restore_dir/
